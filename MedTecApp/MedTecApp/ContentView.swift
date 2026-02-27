@@ -151,9 +151,10 @@ struct WebView: NSViewRepresentable {
     
     // MARK: - Coordinator
     
+    
     class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
         
-        // Self-signed TLS + Basic Auth
+        // TLS + Basic Auth
         func webView(_ webView: WKWebView,
                      didReceive challenge: URLAuthenticationChallenge,
                      completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
@@ -174,6 +175,26 @@ struct WebView: NSViewRepresentable {
                 completionHandler(.useCredential, URLCredential(trust: serverTrust))
             } else {
                 completionHandler(.performDefaultHandling, nil)
+            }
+        }
+        
+        // File upload support
+        func webView(_ webView: WKWebView,
+                     runOpenPanelWith parameters: WKOpenPanelParameters,
+                     initiatedByFrame frame: WKFrameInfo,
+                     completionHandler: @escaping ([URL]?) -> Void) {
+            
+            let panel = NSOpenPanel()
+            panel.canChooseFiles = true
+            panel.canChooseDirectories = false
+            panel.allowsMultipleSelection = parameters.allowsMultipleSelection
+            
+            panel.begin { response in
+                if response == .OK {
+                    completionHandler(panel.urls)
+                } else {
+                    completionHandler(nil)
+                }
             }
         }
         

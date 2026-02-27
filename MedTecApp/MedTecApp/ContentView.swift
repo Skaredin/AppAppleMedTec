@@ -6,8 +6,10 @@
 import SwiftUI
 import WebKit
 import AppKit
+import AVFoundation
+import CoreLocation
 
-// MARK: - Unsafe TLS Delegate (для self-signed сертификата)
+// MARK: - Unsafe TLS Delegate
 
 class UnsafeSessionDelegate: NSObject, URLSessionDelegate {
     func urlSession(_ session: URLSession,
@@ -36,28 +38,28 @@ struct ContentView: View {
             } else {
                 VStack(spacing: 20) {
                     Image(systemName: "network")
-                        .imageScale(.large)
-                        .foregroundStyle(.tint)
-                    
                     Text(statusText)
-                        .multilineTextAlignment(.center)
                 }
                 .padding()
                 .onAppear {
+                    AVCaptureDevice.requestAccess(for: .video) { granted in
+                        print("Camera granted:", granted)
+                    }
+                    
+                    AVCaptureDevice.requestAccess(for: .audio) { granted in
+                        print("Mic granted:", granted)
+                    }
+                    
                     startConnectionLoop()
                 }
             }
         }
     }
     
-    // MARK: - Серверы
-    
     let servers = [
         "https://vpn.myapp.local:5236",
         "https://10.8.0.1:5236"
     ]
-    
-    // MARK: - Бесконечная проверка
     
     func startConnectionLoop() {
         tryConnect()
@@ -65,9 +67,7 @@ struct ContentView: View {
     
     func tryConnect() {
         
-        DispatchQueue.main.async {
-            statusText = "🔄 Проверка подключения..."
-        }
+        statusText = "🔄 Проверка подключения..."
         
         checkNext(urls: servers) { successURL in
             if let url = successURL {
@@ -76,7 +76,7 @@ struct ContentView: View {
                 }
             } else {
                 DispatchQueue.main.async {
-                    statusText = "⏳ Сервер недоступен. Повтор через 3 секунды..."
+                    statusText = "⏳ Повтор через 3 секунды..."
                 }
                 
                 DispatchQueue.global().asyncAfter(deadline: .now() + 3) {
@@ -88,24 +88,18 @@ struct ContentView: View {
     
     func checkNext(urls: [String], completion: @escaping (URL?) -> Void) {
         
-        guard let first = urls.first else {
+        guard let first = urls.first,
+              let url = URL(string: first) else {
             completion(nil)
-            return
-        }
-        
-        guard let url = URL(string: first) else {
-            checkNext(urls: Array(urls.dropFirst()), completion: completion)
             return
         }
         
         var request = URLRequest(url: url)
         request.timeoutInterval = 3
         
-        let session = URLSession(
-            configuration: .default,
-            delegate: UnsafeSessionDelegate(),
-            delegateQueue: nil
-        )
+        let session = URLSession(configuration: .default,
+                                 delegate: UnsafeSessionDelegate(),
+                                 delegateQueue: nil)
         
         session.dataTask(with: request) { _, response, _ in
             
@@ -120,7 +114,7 @@ struct ContentView: View {
     }
 }
 
-// MARK: - WebView with Zoom Support
+// MARK: - WebView
 
 struct WebView: NSViewRepresentable {
     
@@ -134,9 +128,9 @@ struct WebView: NSViewRepresentable {
         
         let config = WKWebViewConfiguration()
         
-        let pagePrefs = WKWebpagePreferences()
-        pagePrefs.allowsContentJavaScript = true
-        config.defaultWebpagePreferences = pagePrefs
+        let prefs = WKWebpagePreferences()
+        prefs.allowsContentJavaScript = true
+        config.defaultWebpagePreferences = prefs
         
         let webView = ZoomableWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
@@ -150,7 +144,6 @@ struct WebView: NSViewRepresentable {
     func updateNSView(_ nsView: ZoomableWebView, context: Context) {}
     
     // MARK: - Coordinator
-    
     
     class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
         
@@ -171,14 +164,14 @@ struct WebView: NSViewRepresentable {
                 return
             }
             
-            if let serverTrust = challenge.protectionSpace.serverTrust {
-                completionHandler(.useCredential, URLCredential(trust: serverTrust))
+            if let trust = challenge.protectionSpace.serverTrust {
+                completionHandler(.useCredential, URLCredential(trust: trust))
             } else {
                 completionHandler(.performDefaultHandling, nil)
             }
         }
         
-        // File upload support
+        // File upload
         func webView(_ webView: WKWebView,
                      runOpenPanelWith parameters: WKOpenPanelParameters,
                      initiatedByFrame frame: WKFrameInfo,
@@ -186,31 +179,53 @@ struct WebView: NSViewRepresentable {
             
             let panel = NSOpenPanel()
             panel.canChooseFiles = true
-            panel.canChooseDirectories = false
             panel.allowsMultipleSelection = parameters.allowsMultipleSelection
             
             panel.begin { response in
-                if response == .OK {
-                    completionHandler(panel.urls)
-                } else {
-                    completionHandler(nil)
-                }
+                completionHandler(response == .OK ? panel.urls : nil)
             }
         }
         
-        // Геолокация
+        // Camera / Microphone permission
         func webView(_ webView: WKWebView,
                      requestMediaCapturePermissionFor origin: WKSecurityOrigin,
                      initiatedByFrame frame: WKFrameInfo,
                      type: WKMediaCaptureType,
                      decisionHandler: @escaping (WKPermissionDecision) -> Void) {
             
-            decisionHandler(.grant)
+            switch type {
+                
+            case .camera:
+                AVCaptureDevice.requestAccess(for: .video) { granted in
+                    DispatchQueue.main.async {
+                        decisionHandler(granted ? .grant : .deny)
+                    }
+                }
+                
+            case .microphone:
+                AVCaptureDevice.requestAccess(for: .audio) { granted in
+                    DispatchQueue.main.async {
+                        decisionHandler(granted ? .grant : .deny)
+                    }
+                }
+                
+            case .cameraAndMicrophone:
+                AVCaptureDevice.requestAccess(for: .video) { videoGranted in
+                    AVCaptureDevice.requestAccess(for: .audio) { audioGranted in
+                        DispatchQueue.main.async {
+                            decisionHandler((videoGranted && audioGranted) ? .grant : .deny)
+                        }
+                    }
+                }
+                
+            default:
+                decisionHandler(.deny)
+            }
         }
     }
 }
 
-// MARK: - Custom WKWebView with Keyboard Zoom
+// MARK: - Zoomable WebView
 
 class ZoomableWebView: WKWebView {
     
@@ -222,32 +237,15 @@ class ZoomableWebView: WKWebView {
     }
     
     override func keyDown(with event: NSEvent) {
-        
-        // Проверяем Command
         if event.modifierFlags.contains(.command) {
-            
             switch event.keyCode {
-                
-            case 24: // "=" key  (⌘ +)
-                pageZoom += 0.1
-                
-            case 27: // "-" key  (⌘ -)
-                pageZoom -= 0.1
-                
-            case 29: // "0" key  (⌘ 0)
-                pageZoom = 1.0
-                
-            default:
-                super.keyDown(with: event)
+            case 24: pageZoom += 0.1
+            case 27: pageZoom -= 0.1
+            case 29: pageZoom = 1.0
+            default: super.keyDown(with: event)
             }
-            
             return
         }
-        
         super.keyDown(with: event)
     }
-}
-
-#Preview {
-    ContentView()
 }

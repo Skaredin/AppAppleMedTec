@@ -8,7 +8,7 @@ import WebKit
 import AppKit
 import AVFoundation
 import CoreLocation
-
+import Combine
 // MARK: - Unsafe TLS Delegate
 
 class UnsafeSessionDelegate: NSObject, URLSessionDelegate {
@@ -16,10 +16,74 @@ class UnsafeSessionDelegate: NSObject, URLSessionDelegate {
                     didReceive challenge: URLAuthenticationChallenge,
                     completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
         
-        if let serverTrust = challenge.protectionSpace.serverTrust {
-            completionHandler(.useCredential, URLCredential(trust: serverTrust))
+        if let trust = challenge.protectionSpace.serverTrust {
+            completionHandler(.useCredential, URLCredential(trust: trust))
         } else {
             completionHandler(.performDefaultHandling, nil)
+        }
+    }
+}
+
+// MARK: - Global App Permissions Manager (Production Style)
+
+class AppPermissions: NSObject, ObservableObject, CLLocationManagerDelegate {
+    
+    static let shared = AppPermissions()
+    
+    private let locationManager = CLLocationManager()
+    
+    @Published var cameraGranted = false
+    @Published var micGranted = false
+    @Published var locationGranted = false
+    
+    @Published var latitude: Double = 0
+    @Published var longitude: Double = 0
+    
+    private override init() {
+        super.init()
+        locationManager.delegate = self
+        locationManager.desiredAccuracy = kCLLocationAccuracyBest
+    }
+    
+    func requestAllPermissions() {
+        
+        // Камера
+        AVCaptureDevice.requestAccess(for: .video) { granted in
+            DispatchQueue.main.async {
+                self.cameraGranted = granted
+            }
+        }
+        
+        // Микрофон
+        AVCaptureDevice.requestAccess(for: .audio) { granted in
+            DispatchQueue.main.async {
+                self.micGranted = granted
+            }
+        }
+        
+        // Геолокация
+        locationManager.requestWhenInUseAuthorization()
+        locationManager.startUpdatingLocation()
+    }
+    
+    // MARK: - CLLocation Delegate
+    
+    func locationManager(_ manager: CLLocationManager,
+                         didChangeAuthorization status: CLAuthorizationStatus) {
+        
+        DispatchQueue.main.async {
+            self.locationGranted = (status == .authorized)
+        }
+    }
+    
+    func locationManager(_ manager: CLLocationManager,
+                         didUpdateLocations locations: [CLLocation]) {
+        
+        guard let loc = locations.last else { return }
+        
+        DispatchQueue.main.async {
+            self.latitude = loc.coordinate.latitude
+            self.longitude = loc.coordinate.longitude
         }
     }
 }
@@ -27,6 +91,8 @@ class UnsafeSessionDelegate: NSObject, URLSessionDelegate {
 // MARK: - Main View
 
 struct ContentView: View {
+    
+    @StateObject private var permissions = AppPermissions.shared
     
     @State private var statusText = "Проверка подключения..."
     @State private var activeURL: URL? = nil
@@ -42,14 +108,7 @@ struct ContentView: View {
                 }
                 .padding()
                 .onAppear {
-                    AVCaptureDevice.requestAccess(for: .video) { granted in
-                        print("Camera granted:", granted)
-                    }
-                    
-                    AVCaptureDevice.requestAccess(for: .audio) { granted in
-                        print("Mic granted:", granted)
-                    }
-                    
+                    permissions.requestAllPermissions()
                     startConnectionLoop()
                 }
             }
@@ -119,18 +178,16 @@ struct ContentView: View {
 struct WebView: NSViewRepresentable {
     
     let url: URL
+    @ObservedObject var permissions = AppPermissions.shared
     
     func makeCoordinator() -> Coordinator {
-        Coordinator()
+        Coordinator(self)
     }
     
     func makeNSView(context: Context) -> ZoomableWebView {
         
         let config = WKWebViewConfiguration()
-        
-        let prefs = WKWebpagePreferences()
-        prefs.allowsContentJavaScript = true
-        config.defaultWebpagePreferences = prefs
+        config.defaultWebpagePreferences.allowsContentJavaScript = true
         
         let webView = ZoomableWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
@@ -143,26 +200,18 @@ struct WebView: NSViewRepresentable {
     
     func updateNSView(_ nsView: ZoomableWebView, context: Context) {}
     
-    // MARK: - Coordinator
-    
     class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
         
-        // TLS + Basic Auth
+        var parent: WebView
+        
+        init(_ parent: WebView) {
+            self.parent = parent
+        }
+        
+        // TLS bypass
         func webView(_ webView: WKWebView,
                      didReceive challenge: URLAuthenticationChallenge,
                      completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
-            
-            if challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodHTTPBasic {
-                
-                let credential = URLCredential(
-                    user: "login",
-                    password: "password",
-                    persistence: .forSession
-                )
-                
-                completionHandler(.useCredential, credential)
-                return
-            }
             
             if let trust = challenge.protectionSpace.serverTrust {
                 completionHandler(.useCredential, URLCredential(trust: trust))
@@ -171,56 +220,23 @@ struct WebView: NSViewRepresentable {
             }
         }
         
-        // File upload
+        // Когда страница загрузилась — передаём координаты в JS
         func webView(_ webView: WKWebView,
-                     runOpenPanelWith parameters: WKOpenPanelParameters,
-                     initiatedByFrame frame: WKFrameInfo,
-                     completionHandler: @escaping ([URL]?) -> Void) {
+                     didFinish navigation: WKNavigation!) {
             
-            let panel = NSOpenPanel()
-            panel.canChooseFiles = true
-            panel.allowsMultipleSelection = parameters.allowsMultipleSelection
+            let lat = parent.permissions.latitude
+            let lon = parent.permissions.longitude
             
-            panel.begin { response in
-                completionHandler(response == .OK ? panel.urls : nil)
-            }
-        }
-        
-        // Camera / Microphone permission
-        func webView(_ webView: WKWebView,
-                     requestMediaCapturePermissionFor origin: WKSecurityOrigin,
-                     initiatedByFrame frame: WKFrameInfo,
-                     type: WKMediaCaptureType,
-                     decisionHandler: @escaping (WKPermissionDecision) -> Void) {
+            let script = """
+            window.appDevice = {
+                latitude: \(lat),
+                longitude: \(lon),
+                cameraGranted: \(parent.permissions.cameraGranted),
+                micGranted: \(parent.permissions.micGranted)
+            };
+            """
             
-            switch type {
-                
-            case .camera:
-                AVCaptureDevice.requestAccess(for: .video) { granted in
-                    DispatchQueue.main.async {
-                        decisionHandler(granted ? .grant : .deny)
-                    }
-                }
-                
-            case .microphone:
-                AVCaptureDevice.requestAccess(for: .audio) { granted in
-                    DispatchQueue.main.async {
-                        decisionHandler(granted ? .grant : .deny)
-                    }
-                }
-                
-            case .cameraAndMicrophone:
-                AVCaptureDevice.requestAccess(for: .video) { videoGranted in
-                    AVCaptureDevice.requestAccess(for: .audio) { audioGranted in
-                        DispatchQueue.main.async {
-                            decisionHandler((videoGranted && audioGranted) ? .grant : .deny)
-                        }
-                    }
-                }
-                
-            default:
-                decisionHandler(.deny)
-            }
+            webView.evaluateJavaScript(script, completionHandler: nil)
         }
     }
 }

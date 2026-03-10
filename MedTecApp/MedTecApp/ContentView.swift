@@ -10,6 +10,8 @@ import AVFoundation
 import CoreLocation
 import Combine
 import Cocoa
+import Network
+
 // MARK: - Unsafe TLS Delegate
 
 class UnsafeSessionDelegate: NSObject, URLSessionDelegate {
@@ -101,13 +103,18 @@ struct ContentView: View {
     @State private var connectionLost = false
     @State private var showHelp = false
     @State private var pageReady = false
+    @State private var webViewRef: WKWebView?
+    @StateObject private var network = NetworkMonitor.shared
+    
     var body: some View {
         Group {
             if let url = activeURL {
 
                 ZStack {
 
-                    WebView(url: url,
+                    WebView(
+                        url: url,
+                        webViewRef: $webViewRef,
                             onConnectionLost: {
                                     connectionLost = true
                                     pageReady = false
@@ -134,8 +141,9 @@ struct ContentView: View {
                             Text("Соединение разорвано")
                                 .font(.headline)
 
-                            Text("Пытаемся восстановить поток...")
-                                .foregroundColor(.secondary)
+                            Text(network.state == "offline"
+                                 ? "Ожидание подключения к интернету..."
+                                 : "Проверяем сервер...")
 
                             HStack {
 
@@ -153,6 +161,54 @@ struct ContentView: View {
                         .cornerRadius(12)
 
                     }
+                    
+                    VStack {
+                        Spacer()
+
+                        HStack {
+
+                            Spacer().frame(width: 16)
+
+                            HStack(spacing: 12) {
+
+                                Button {
+                                    webViewRef?.evaluateJavaScript("history.back()")
+                                } label: {
+                                    Image(systemName: "chevron.left")
+                                }
+
+                                Button {
+                                    webViewRef?.evaluateJavaScript("history.forward()")
+                                } label: {
+                                    Image(systemName: "chevron.right")
+                                }
+
+                                Divider().frame(height: 18)
+
+                                HStack(spacing: 4) {
+
+                                    Circle()
+                                        .fill(colorForState(network.state))
+                                        .frame(width: 8, height: 8)
+
+                                    Text(network.state == "offline"
+                                         ? "offline"
+                                         : "\(network.latency) ms")
+                                    .font(.system(size: 12, weight: .medium))
+                                    .foregroundColor(.secondary)
+
+                                }
+
+                            }
+                            .padding(10)
+                            .background(.ultraThinMaterial)
+                            .cornerRadius(10)
+
+                            Spacer()
+                        }
+
+                        Spacer().frame(height: 16)
+                    }
 
                 }
                 .sheet(isPresented: $showHelp) {
@@ -167,6 +223,7 @@ struct ContentView: View {
                 .padding()
                 .onAppear {
                     permissions.requestAllPermissions()
+                    network.start()
                     startConnectionLoop()
                 }
             }
@@ -236,6 +293,7 @@ struct ContentView: View {
 struct WebView: NSViewRepresentable {
 
     let url: URL
+        @Binding var webViewRef: WKWebView?
     var onConnectionLost: (() -> Void)?
     var onConnectionRestored: (() -> Void)?
     var onPageReady: (() -> Void)?
@@ -256,6 +314,10 @@ struct WebView: NSViewRepresentable {
         let webView = ZoomableWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
         webView.uiDelegate = context.coordinator
+        
+        DispatchQueue.main.async {
+            self.webViewRef = webView
+        }
         
         webView.load(URLRequest(url: url))
         
@@ -325,19 +387,59 @@ struct WebView: NSViewRepresentable {
         func reloadLater(_ webView: WKWebView) {
 
             DispatchQueue.main.async {
-
                 self.parent.onConnectionLost?()
-
             }
 
-            DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
-
-                self.parent.parentReload?()
-
-            }
-
+            waitForNetworkThenReload(webView)
         }
+        func waitForNetworkThenReload(_ webView: WKWebView) {
 
+            // если интернета нет — ждём
+            if NetworkMonitor.shared.state == "offline" {
+
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                    self.waitForNetworkThenReload(webView)
+                }
+
+                return
+            }
+
+            // интернет появился — проверяем сервер
+            testServerAndReload(webView)
+        }
+        func testServerAndReload(_ webView: WKWebView) {
+
+            guard let url = webView.url else { return }
+
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 1
+
+            let session = URLSession(configuration: .default,
+                                     delegate: UnsafeSessionDelegate(),
+                                     delegateQueue: nil)
+
+            session.dataTask(with: request) { _, response, error in
+
+                if let http = response as? HTTPURLResponse,
+                   (200...399).contains(http.statusCode) {
+
+                    DispatchQueue.main.async {
+
+                        webView.load(URLRequest(url: url))
+
+                    }
+
+                } else {
+
+                    // сервер ещё не поднялся
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                        self.testServerAndReload(webView)
+                    }
+
+                }
+
+            }.resume()
+        }
         
     }
 }
@@ -469,4 +571,107 @@ struct ConnectionHelpView: View {
 
     }
 
+}
+func colorForState(_ state: String) -> Color {
+
+    switch state {
+
+    case "good":
+        return .green
+
+    case "slow":
+        return .yellow
+
+    case "bad":
+        return .orange
+
+    case "offline":
+        return .red
+
+    default:
+        return .gray
+    }
+}
+class NetworkMonitor: ObservableObject {
+
+    static let shared = NetworkMonitor()
+
+    @Published var latency: Int = 0
+    @Published var state: String = "..."
+
+    private var timer: Timer?
+    private let monitor = NWPathMonitor()
+    private let queue = DispatchQueue(label: "NetworkMonitor")
+
+    func start() {
+
+        monitor.pathUpdateHandler = { path in
+
+            DispatchQueue.main.async {
+
+                if path.status == .satisfied {
+
+                    // сеть появилась
+                    self.check()
+
+                } else {
+
+                    // сеть пропала
+                    self.state = "offline"
+                    self.latency = 0
+
+                }
+
+            }
+
+        }
+
+        monitor.start(queue: queue)
+
+        timer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { _ in
+            self.check()
+        }
+
+        check()
+    }
+
+    func check() {
+
+        guard let url = URL(string: "https://vpn.myapp.local:5236") else { return }
+
+        let start = Date()
+
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 1.2
+
+        let session = URLSession(configuration: .default,
+                                 delegate: UnsafeSessionDelegate(),
+                                 delegateQueue: nil)
+
+        session.dataTask(with: request) { _, response, error in
+
+            DispatchQueue.main.async {
+
+                if error != nil {
+                    self.latency = 0
+                    self.state = "offline"
+                    return
+                }
+
+                let ms = Int(Date().timeIntervalSince(start) * 1000)
+
+                self.latency = ms
+
+                if ms < 80 {
+                    self.state = "good"
+                } else if ms < 200 {
+                    self.state = "slow"
+                } else {
+                    self.state = "bad"
+                }
+
+            }
+
+        }.resume()
+    }
 }

@@ -9,6 +9,7 @@ import AppKit
 import AVFoundation
 import CoreLocation
 import Combine
+import Cocoa
 // MARK: - Unsafe TLS Delegate
 
 class UnsafeSessionDelegate: NSObject, URLSessionDelegate {
@@ -96,11 +97,68 @@ struct ContentView: View {
     
     @State private var statusText = "Проверка подключения..."
     @State private var activeURL: URL? = nil
-    
+    @State private var webViewID = UUID()
+    @State private var connectionLost = false
+    @State private var showHelp = false
+    @State private var pageReady = false
     var body: some View {
         Group {
             if let url = activeURL {
-                WebView(url: url)
+
+                ZStack {
+
+                    WebView(url: url,
+                            onConnectionLost: {
+                                    connectionLost = true
+                                    pageReady = false
+                                },
+                                onConnectionRestored: {
+                                    connectionLost = false
+                                },
+                                onPageReady: {
+                                    pageReady = true
+                                }
+                    ) {
+                        webViewID = UUID()
+                    }
+                    .id(webViewID)
+                    .opacity(pageReady ? 1 : 0)
+
+                    if connectionLost {
+
+                        VStack(spacing: 16) {
+
+                            Image(systemName: "wifi.exclamationmark")
+                                .font(.system(size: 40))
+
+                            Text("Соединение разорвано")
+                                .font(.headline)
+
+                            Text("Пытаемся восстановить поток...")
+                                .foregroundColor(.secondary)
+
+                            HStack {
+
+                                ProgressView()
+
+                                Button("Подробно") {
+                                    showHelp = true
+                                }
+
+                            }
+
+                        }
+                        .padding(30)
+                        .background(.ultraThinMaterial)
+                        .cornerRadius(12)
+
+                    }
+
+                }
+                .sheet(isPresented: $showHelp) {
+                    ConnectionHelpView()
+                }
+
             } else {
                 VStack(spacing: 20) {
                     Image(systemName: "network")
@@ -176,8 +234,12 @@ struct ContentView: View {
 // MARK: - WebView
 
 struct WebView: NSViewRepresentable {
-    
+
     let url: URL
+    var onConnectionLost: (() -> Void)?
+    var onConnectionRestored: (() -> Void)?
+    var onPageReady: (() -> Void)?
+    var parentReload: (() -> Void)?
     @ObservedObject var permissions = AppPermissions.shared
     
     func makeCoordinator() -> Coordinator {
@@ -188,6 +250,8 @@ struct WebView: NSViewRepresentable {
         
         let config = WKWebViewConfiguration()
         config.defaultWebpagePreferences.allowsContentJavaScript = true
+        config.websiteDataStore = .default()
+        config.limitsNavigationsToAppBoundDomains = false
         
         let webView = ZoomableWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
@@ -223,10 +287,15 @@ struct WebView: NSViewRepresentable {
         // Когда страница загрузилась — передаём координаты в JS
         func webView(_ webView: WKWebView,
                      didFinish navigation: WKNavigation!) {
-            
+
+            DispatchQueue.main.async {
+                self.parent.onConnectionRestored?()
+                self.parent.onPageReady?()
+            }
+
             let lat = parent.permissions.latitude
             let lon = parent.permissions.longitude
-            
+
             let script = """
             window.appDevice = {
                 latitude: \(lat),
@@ -235,12 +304,102 @@ struct WebView: NSViewRepresentable {
                 micGranted: \(parent.permissions.micGranted)
             };
             """
-            
+
             webView.evaluateJavaScript(script, completionHandler: nil)
         }
+
+        func webView(_ webView: WKWebView,
+                     didFail navigation: WKNavigation!,
+                     withError error: Error) {
+
+            reloadLater(webView)
+        }
+
+        func webView(_ webView: WKWebView,
+                     didFailProvisionalNavigation navigation: WKNavigation!,
+                     withError error: Error) {
+
+            reloadLater(webView)
+        }
+
+        func reloadLater(_ webView: WKWebView) {
+
+            DispatchQueue.main.async {
+
+                self.parent.onConnectionLost?()
+
+            }
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+
+                self.parent.parentReload?()
+
+            }
+
+        }
+
+        
+    }
+}
+class AppDelegate: NSObject, NSApplicationDelegate {
+
+    var statusItem: NSStatusItem!
+    var window: NSWindow?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+
+        DispatchQueue.main.async {
+            self.window = NSApp.windows.first
+            self.window?.delegate = self
+        }
+
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+
+        if let button = statusItem.button {
+            button.image = NSImage(systemSymbolName: "network", accessibilityDescription: "MedTec")
+            button.action = #selector(toggleWindow)
+        }
+
+        let menu = NSMenu()
+        menu.addItem(NSMenuItem(title: "Открыть", action: #selector(showWindow), keyEquivalent: "o"))
+        menu.addItem(NSMenuItem.separator())
+        menu.addItem(NSMenuItem(title: "Выход", action: #selector(quit), keyEquivalent: "q"))
+
+        statusItem.menu = menu
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        return false
+    }
+
+    @objc func showWindow() {
+        NSApp.activate(ignoringOtherApps: true)
+        window?.makeKeyAndOrderFront(nil)
+    }
+
+    @objc func toggleWindow() {
+        if let window = window {
+            if window.isVisible {
+                window.orderOut(nil)
+            } else {
+                showWindow()
+            }
+        }
+    }
+
+    @objc func quit() {
+        NSApp.terminate(nil)
     }
 }
 
+extension AppDelegate: NSWindowDelegate {
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        sender.orderOut(nil)
+        return false
+    }
+
+}
 // MARK: - Zoomable WebView
 
 class ZoomableWebView: WKWebView {
@@ -264,4 +423,50 @@ class ZoomableWebView: WKWebView {
         }
         super.keyDown(with: event)
     }
+}
+
+struct ConnectionHelpView: View {
+
+    @Environment(\.dismiss) var dismiss
+
+    var body: some View {
+
+        VStack(alignment: .leading, spacing: 20) {
+
+            HStack {
+
+                Text("Что делать при разрыве соединения")
+                    .font(.title2)
+                    .bold()
+
+                Spacer()
+
+                Button("Закрыть") {
+                    dismiss()
+                }
+
+            }
+
+            VStack(alignment: .leading, spacing: 10) {
+
+                Label("Проверьте подключение к интернету", systemImage: "wifi")
+
+                Label("Проверьте сетевой кабель", systemImage: "cable.connector")
+
+                Label("Убедитесь что VPN подключен", systemImage: "lock.shield")
+
+                Label("Попробуйте перезапустить приложение", systemImage: "arrow.clockwise")
+
+                Label("Если проблема повторяется — обратитесь к администратору", systemImage: "person.crop.circle.badge.exclamationmark")
+
+            }
+
+            Spacer()
+
+        }
+        .padding(30)
+        .frame(width: 420, height: 260)
+
+    }
+
 }

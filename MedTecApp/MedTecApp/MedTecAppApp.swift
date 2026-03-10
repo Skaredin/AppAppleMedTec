@@ -8,7 +8,10 @@
 import SwiftUI
 
 @main
-struct MedTecAppApp: App {
+struct MedTecApp: App {
+
+    @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
+
     var body: some Scene {
         WindowGroup {
             ContentView()

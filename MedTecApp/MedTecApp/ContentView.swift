@@ -183,6 +183,12 @@ struct ContentView: View {
                                     Image(systemName: "chevron.right")
                                 }
 
+                                Button {
+                                    resetApp()
+                                } label: {
+                                    Image(systemName: "arrow.clockwise")
+                                }
+
                                 Divider().frame(height: 18)
 
                                 HStack(spacing: 4) {
@@ -238,7 +244,30 @@ struct ContentView: View {
     func startConnectionLoop() {
         tryConnect()
     }
-    
+    func resetApp() {
+
+        statusText = "Перезапуск..."
+        activeURL = nil
+        pageReady = false
+        connectionLost = false
+
+        webViewRef?.stopLoading()
+        webViewRef = nil
+
+        // очищаем кеш WebView
+        WKWebsiteDataStore.default().fetchDataRecords(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes()) { records in
+            WKWebsiteDataStore.default().removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(),
+                                                    for: records) {
+
+                DispatchQueue.main.async {
+
+                    webViewID = UUID()
+
+                    startConnectionLoop()
+                }
+            }
+        }
+    }
     func tryConnect() {
         
         statusText = "🔄 Проверка подключения..."
@@ -463,10 +492,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "Открыть", action: #selector(showWindow), keyEquivalent: "o"))
-        menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "Выход", action: #selector(quit), keyEquivalent: "q"))
 
+        menu.addItem(NSMenuItem(title: "Открыть", action: #selector(showWindow), keyEquivalent: "o"))
+
+        menu.addItem(NSMenuItem(title: "Перезапустить", action: #selector(restartApp), keyEquivalent: "r"))
+
+        menu.addItem(NSMenuItem.separator())
+
+        menu.addItem(NSMenuItem(title: "Выход", action: #selector(quit), keyEquivalent: "q"))
         statusItem.menu = menu
     }
 
@@ -491,6 +524,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func quit() {
         NSApp.terminate(nil)
+    }
+    @objc func restartApp() {
+
+        let path = Bundle.main.bundlePath
+
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        task.arguments = ["-n", path]
+
+        try? task.run()
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            NSApp.terminate(nil)
+        }
     }
 }
 
